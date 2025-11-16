@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Motion Data Cartography Graph (Optimisé Portable)</title>
+    
+    <style>
+        body {
+            /* Assurer que le corps prend toute la vue sur mobile */
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #000000; 
+            width: 100vw;
+            height: 100vh;
+            /* Empêcher le zoom par pincement sur certains navigateurs mobiles */
+            touch-action: manipulation; 
+        }
+        canvas {
+            display: block;
+            position: absolute; 
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+        }
+        #webcamStream, #motionCanvas {
+            /* Éléments cachés utilisés pour l'analyse vidéo */
+            display: none; 
+        }
+    </style>
+</head>
+<body>
+    <video id="webcamStream" autoplay playsinline></video>
+    <canvas id="motionCanvas"></canvas>
+    <canvas id="visualizer"></canvas>
+
+    <script>
+        const video = document.getElementById('webcamStream');
+        const motionCanvas = document.getElementById('motionCanvas');
+        const motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true }); 
+        const visualizerCanvas = document.getElementById('visualizer');
+        const visualizerCtx = visualizerCanvas.getContext('2d');
+        
+        let running = false;
+        let time = 0;
+        let nodes = []; 
+        let prevImageData = null; 
+        let frameCounter = 0; // AJOUT : Compteur pour limiter le taux de détection de mouvement
+        
+        // Configuration du Graphe
+        const CONFIG = {
+            analysisScale: 160, 
+            
+            // Paramètres de sensibilité et de précision
+            nodeLifespan: 100,      
+            motionThreshold: 8000, 
+            maxNodes: 30,         
+            nodeDispersion: 30, 
+            
+            nodeColor: '#FFFFFF', 
+            backgroundColor: '#000000', 
+            
+            // Connexions
+            connectionThreshold: 0.15, 
+            MAX_LINES_PER_NODE: 4, 
+            
+            // Paramètres d'affichage des blocs
+            minBaseSize: 8, 
+            maxBaseSize: 35, 
+            aspectRatioVariation: 0.8, 
+            dispersionMargin: 0,
+        };
+
+        function resizeCanvas() {
+            visualizerCanvas.width = window.innerWidth;
+            visualizerCanvas.height = window.innerHeight;
+            motionCanvas.width = CONFIG.analysisScale;
+            motionCanvas.height = Math.floor(CONFIG.analysisScale * 0.75); 
+            
+            initWebcam();
+        }
+
+        // --- GESTION DES NŒUDS DE DONNÉES (BLOCS) ---
+        
+        function addNewNode(motionIntensity, motionRegion, motionCenterX, motionCenterY) {
+            
+            if (nodes.length >= CONFIG.maxNodes) {
+                nodes.shift(); 
+            }
+            
+            // CONVERSION ET CORRECTION DE L'AXE X (EFFET MIROIR)
+            const normalizedX = motionCenterX / motionCanvas.width;
+            const correctedNormalizedX = 1 - normalizedX; 
+            
+            const xPos = correctedNormalizedX * visualizerCanvas.width;
+            const yPos = (motionCenterY / motionCanvas.height) * visualizerCanvas.height;
+
+            // Réduction de la dispersion pour une meilleure fidélité au centre de mouvement
+            const dispersionFactor = 0.3; 
+            const dispersionX = (Math.random() - 0.5) * CONFIG.nodeDispersion * dispersionFactor; 
+            const dispersionY = (Math.random() - 0.5) * CONFIG.nodeDispersion * dispersionFactor; 
+            
+            let finalX = xPos + dispersionX;
+            let finalY = yPos + dispersionY;
+
+            // Assurer les limites
+            finalX = Math.max(CONFIG.dispersionMargin, Math.min(finalX, visualizerCanvas.width - CONFIG.dispersionMargin));
+            finalY = Math.max(CONFIG.dispersionMargin, Math.min(finalY, visualizerCanvas.height - CONFIG.dispersionMargin));
+            
+            // Calcul de la taille et de la forme
+            const intensityNorm = Math.min(1, motionIntensity / 25000); 
+            const baseSize = CONFIG.minBaseSize + intensityNorm * (CONFIG.maxBaseSize - CONFIG.minBaseSize);
+            const regionNorm = motionRegion / 10; 
+            
+            let width = baseSize;
+            let height = baseSize;
+
+            const variationFactor = 1 + (Math.random() - 0.5) * CONFIG.aspectRatioVariation * 2;
+            
+            if (regionNorm < 0.5) { 
+                width *= variationFactor;
+                height /= variationFactor;
+            } else { 
+                width /= variationFactor;
+                height *= variationFactor;
+            }
+            
+            width = Math.max(CONFIG.minBaseSize / 2, Math.min(width, CONFIG.maxBaseSize * 1.5));
+            height = Math.max(CONFIG.minBaseSize / 2, Math.min(height, CONFIG.maxBaseSize * 1.5));
+
+            // Générer des données factices
+            const num1 = Math.floor(Math.random() * 99) + 1;
+            const num2 = Math.floor(Math.random() * 99) + 1;
+            const dataValue = `${num1}.${num2}`.replace(/,/g, '.');
+
+            nodes.push({
+                x: finalX,
+                y: finalY,
+                data: dataValue,
+                intensity: motionIntensity,
+                region: motionRegion,
+                spawnTime: time,
+                life: CONFIG.nodeLifespan,
+                width: width,   
+                height: height 
+            });
+        }
+        
+        function updateNodes() {
+            nodes = nodes.filter(node => node.life > 0);
+
+            nodes.forEach(node => {
+                node.life--;
+                node.x += Math.sin(time * 0.1 + node.spawnTime) * 0.8;
+                node.y += Math.cos(time * 0.1 + node.spawnTime) * 0.8;
+                node.opacity = node.life / CONFIG.nodeLifespan;
+            });
+        }
+
+        // --- DÉTECTION DE MOUVEMENT ET CALCUL DE LA POSITION ---
+
+        function checkMotion() {
+            if (video.readyState < video.HAVE_FUTURE_DATA || video.paused || video.ended) {
+                return;
+            }
+
+            motionCtx.drawImage(video, 0, 0, motionCanvas.width, motionCanvas.height);
+            const currentImageData = motionCtx.getImageData(0, 0, motionCanvas.width, motionCanvas.height);
+            const data = currentImageData.data;
+
+            if (prevImageData) {
+                let totalMotion = 0;
+                let motionWeightedX = 0;
+                let motionWeightedY = 0;
+                
+                const NUM_REGIONS = 10; 
+                const regionData = []; 
+                for (let k = 0; k < NUM_REGIONS; k++) {
+                    regionData.push({ 
+                        intensity: 0, 
+                        weightedX: 0, 
+                        weightedY: 0
+                    });
+                }
+
+                const regionWidth = Math.floor(motionCanvas.width / NUM_REGIONS);
+                const prevData = prevImageData.data;
+
+                for (let i = 0; i < data.length; i += 4) {
+                    const diff = Math.abs(data[i] - prevData[i]) + 
+                                 Math.abs(data[i+1] - prevData[i+1]) + 
+                                 Math.abs(data[i+2] - prevData[i+2]);
+                    
+                    if (diff > 200) { 
+                        const diffWeighted = diff * diff;
+
+                        totalMotion += diffWeighted;
+                        
+                        const pixelIndex = i / 4;
+                        const x = pixelIndex % motionCanvas.width;
+                        const y = Math.floor(pixelIndex / motionCanvas.width);
+                        
+                        // Calcul pour le mouvement global
+                        motionWeightedX += x * diffWeighted;
+                        motionWeightedY += y * diffWeighted;
+                        
+                        // Calcul pour le mouvement par région
+                        const region = Math.floor(x / regionWidth);
+                        if (region < NUM_REGIONS) {
+                            regionData[region].intensity += diffWeighted;
+                            regionData[region].weightedX += x * diffWeighted;
+                            regionData[region].weightedY += y * diffWeighted;
+                        }
+                    }
+                }
+                
+                // Calcul du centre de mouvement GLOBAL
+                let motionCenterX = motionCanvas.width / 2;
+                let motionCenterY = motionCanvas.height / 2;
+
+                if (totalMotion > 0) {
+                    motionCenterX = motionWeightedX / totalMotion;
+                    motionCenterY = motionWeightedY / totalMotion;
+                }
+                
+                // Création du Nœud GLOBAL 
+                if (totalMotion > CONFIG.motionThreshold * 5) { 
+                    addNewNode(totalMotion, Math.floor(Math.random() * NUM_REGIONS), motionCenterX, motionCenterY); 
+                }
+
+                // Création des Nœuds PAR RÉGION
+                regionData.forEach((data, index) => {
+                    const regionalThreshold = CONFIG.motionThreshold / 5;
+                    if (data.intensity > regionalThreshold) { 
+                        let centerX = motionCenterX;
+                        let centerY = motionCenterY;
+
+                        if (data.intensity > 0) {
+                            centerX = data.weightedX / data.intensity;
+                            centerY = data.weightedY / data.intensity;
+                        }
+
+                        addNewNode(data.intensity, index, centerX, centerY);
+                    }
+                });
+            }
+            
+            prevImageData = motionCtx.getImageData(0, 0, motionCanvas.width, motionCanvas.height); 
+        }
+        
+        // --- FONCTIONS DE DESSIN ---
+
+        function drawConnections() {
+            visualizerCtx.strokeStyle = CONFIG.nodeColor;
+            visualizerCtx.lineWidth = 1;
+            
+            const lineCounts = nodes.map(() => 0); 
+
+            for (let i = 0; i < nodes.length; i++) {
+                for (let j = i + 1; j < nodes.length; j++) {
+                    const nodeA = nodes[i];
+                    const nodeB = nodes[j];
+                    
+                    if (lineCounts[i] >= CONFIG.MAX_LINES_PER_NODE || lineCounts[j] >= CONFIG.MAX_LINES_PER_NODE) {
+                        continue; 
+                    }
+
+                    const timeDiff = Math.abs(nodeA.spawnTime - nodeB.spawnTime);
+                    const correlatedByTime = timeDiff < 150; 
+
+                    const regionDiff = Math.abs(nodeA.region - nodeB.region) / 10;
+                    const correlatedByRegion = regionDiff < CONFIG.connectionThreshold; 
+
+                    if (correlatedByTime && correlatedByRegion) {
+                        
+                        let opacity = Math.min(nodeA.opacity, nodeB.opacity);
+                        
+                        visualizerCtx.globalAlpha = opacity;
+                        
+                        visualizerCtx.beginPath();
+                        visualizerCtx.moveTo(nodeA.x, nodeA.y);
+                        visualizerCtx.lineTo(nodeB.x, nodeB.y);
+                        visualizerCtx.stroke();
+                        
+                        lineCounts[i]++;
+                        lineCounts[j]++;
+                    }
+                }
+            }
+            visualizerCtx.globalAlpha = 1; 
+        }
+
+        function drawNodes() {
+            nodes.forEach(node => {
+                visualizerCtx.globalAlpha = node.opacity;
+                
+                const nodeWidth = node.width;
+                const nodeHeight = node.height;
+                
+                visualizerCtx.fillStyle = CONFIG.nodeColor; 
+                visualizerCtx.fillRect(node.x - nodeWidth / 2, node.y - nodeHeight / 2, nodeWidth, nodeHeight);
+                
+                visualizerCtx.strokeStyle = CONFIG.nodeColor;
+                visualizerCtx.lineWidth = 1;
+                visualizerCtx.strokeRect(node.x - nodeWidth / 2, node.y - nodeHeight / 2, nodeWidth, nodeHeight);
+
+                visualizerCtx.fillStyle = CONFIG.backgroundColor; 
+                visualizerCtx.font = '10px monospace';
+                visualizerCtx.textAlign = 'center';
+                visualizerCtx.textBaseline = 'middle';
+                visualizerCtx.fillText(node.data, node.x, node.y);
+                
+                visualizerCtx.fillStyle = CONFIG.nodeColor; 
+                visualizerCtx.font = '8px monospace';
+                visualizerCtx.textAlign = 'left';
+                visualizerCtx.fillText(`R:${node.region} M:${Math.floor(node.intensity)}`, node.x + nodeWidth / 2 + 5, node.y);
+            });
+            visualizerCtx.globalAlpha = 1; 
+        }
+        
+        // --- CORE LOGIC & INITIALISATION ---
+
+        function draw() {
+            visualizerCtx.fillStyle = CONFIG.backgroundColor; 
+            visualizerCtx.fillRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
+
+            // checkMotion() a été retiré de draw()
+            updateNodes();
+            
+            drawConnections();
+            drawNodes();
+        }
+
+        async function initWebcam() {
+            if (running) return;
+
+            try {
+                // Tente d'accéder à la webcam avec des contraintes de résolution pour le mobile
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        facingMode: "user",
+                        width: { ideal: 160 }, // Optimisation mobile
+                        height: { ideal: 120 } // Optimisation mobile
+                    }, 
+                    audio: false 
+                });
+                video.srcObject = stream;
+                
+                await new Promise((resolve) => {
+                    video.onloadedmetadata = () => {
+                        video.play();
+                        resolve();
+                    };
+                });
+
+                running = true;
+                animate();
+                
+            } catch (err) {
+                console.error("Erreur d'accès à la webcam : ", err);
+                alert("Impossible d'accéder à la webcam. Si ce message apparaît, veuillez cliquer n'importe où sur l'écran pour débloquer l'accès.");
+            }
+        }
+
+        function animate() {
+            time++;
+            frameCounter++;
+
+            // NOUVEAU : Limiter l'analyse de mouvement pour les performances mobiles (1 fois toutes les 3 images)
+            if (frameCounter % 3 === 0) { 
+                checkMotion(); 
+                frameCounter = 0;
+            }
+            
+            draw();
+            requestAnimationFrame(animate);
+        }
+
+        // Lancement immédiat de la tentative de démarrage
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        
+        // En cas de blocage par le navigateur (navigateur n'autorisant pas l'autoplay de la caméra)
+        document.addEventListener('click', initWebcam, { once: true });
+        document.addEventListener('touchstart', initWebcam, { once: true });
+
+    </script>
+</body>
+</html>
